@@ -33,7 +33,7 @@ The problem here is that we create an immutable buffer, but then mutate it in th
 
 Before looking any closer though, I do want to point out the fix. It is simple enough, just make `buf` mutable, and in our call to `ioctl`, pass `&mut buf` instead of `&buf`. Problem solved. And even if this isn't *technically* UB, you can see that this is the safest approach regardless.
 
-Now let's dig in and do some testing. First, I was curious why the compiler didn't pick up on this issue. After all, even raw pointers require a `const` or `mut` keyword, and `ioctl` comes from an third-party library (libc, to be specific), so maybe it is defined incorrectly? A quick check of [docs.rs](https://docs.rs/libc/0.2.66/libc/fn.ioctl.html) reveals the function signature.
+Now let's dig in and do some testing. First, I was curious why the compiler didn't pick up on this issue. After all, even raw pointers require a `const` or `mut` keyword, and `ioctl` comes from a third-party library (libc, to be specific), so maybe it is defined incorrectly? A quick check of [docs.rs](https://docs.rs/libc/0.2.66/libc/fn.ioctl.html) reveals the function signature.
 
 ```rust
 pub unsafe extern "C" fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int
@@ -59,6 +59,8 @@ fn main() {
 ([playground](https://play.rust-lang.org/?version=stable&mode=debug&edition=2018&gist=246270064e900087a0e969a93b3c05d3))
 
 So here is the "cheat": our FFI call isn't actually calling C code, it's just an FFI wrapper around Rust. The benefit is that we can analyze this code with Miri, a Rust tool that helps detect undefined behavior. Miri works by compiling the original code into an intermediate language (MIR) and interpreting it. Generating MIR is part of the normal compilation process, which is important because it means the compiler could perform optimizations on the generated MIR before compiling it down to machine code. On top of that, the compiler may use some assumptions when optimizing code. Any code that fails to maintain these assumptions could be "optimized" and end up doing just about anything. In other words, such code constitutes undefined behavior.
+
+A quick note: Miri is an excellent tool, however it cannot detect all kinds of UB. See the project [README](https://github.com/rust-lang/miri/blob/master/README.md) for more details.
 
 The line `let x_ptr = ...` exists primarily to try and "trick" the compiler. Normally, type-checking would prevent us from creating a mutable pointer to x, however we want to get around that for this test. In addition, it would be great (for this test) if the compiler would just "forget" that x_ptr is in any way related to x, so we cast it to a `usize` temporarily. At this point, the "pointer" is actually just some integer value.
 
@@ -111,3 +113,9 @@ fn main() {
 Here, we break a different rule in Rust: no two mutable borrows may reference the same memory. `UnsafeCell` does not change this assumption, and so even when using `UnsafeCell`, we still need to be wary of creating mutable references to it.
 
 So to summarize what we've seen: if you intend to mutate something, even across FFI boundaries, always delcare it mutable, always take a mutable reference, and never convert said reference to an immutable reference or pointer. The only exception being if you use `UnsafeCell` to disable Rust's normal assumptions.
+
+## Following Up
+
+It's come to my attention that in some instances it might be okay to convert a `*const` to a `*mut` and mutate it, however it's not clear to me yet when it is and isn't okay to do this. I may play around some more and make a follow up post in the future. For now, suffice to say that Rust's own [NonNull](https://doc.rust-lang.org/std/ptr/struct.NonNull.html) type uses `*const` internally but does allow converting to a `*mut` or `&mut`.
+
+Additionally, many of these concepts are related to an aliasing model called [Stacked Borrows](https://www.ralfj.de/blog/2019/05/21/stacked-borrows-2.1.html), which is the model Miri is based on. Rust, however, does not yet have an official aliasing model, so precisely what constitutes UB is subject to change. A detailed paper on the model can be found [here](https://plv.mpi-sws.org/rustbelt/stacked-borrows/paper.pdf). I won't claim to fully understand this model, however as I explore and test the ideas of this model, I may make additional posts.
