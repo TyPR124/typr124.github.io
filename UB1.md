@@ -56,6 +56,7 @@ fn main() {
     println!("x: {}", x);
 }
 ```
+
 ([playground](https://play.rust-lang.org/?version=stable&mode=debug&edition=2018&gist=246270064e900087a0e969a93b3c05d3))
 
 So here is the "cheat": our FFI call isn't actually calling C code, it's just an FFI wrapper around Rust. The benefit is that we can analyze this code with Miri, a Rust tool that helps detect undefined behavior. Miri works by compiling the original code into an intermediate language (MIR) and interpreting it. Generating MIR is part of the normal compilation process, which is important because it means the compiler could perform optimizations on the generated MIR before compiling it down to machine code. On top of that, the compiler may use some assumptions when optimizing code. Any code that fails to maintain these assumptions could be "optimized" and end up doing just about anything. In other words, such code constitutes undefined behavior.
@@ -68,7 +69,7 @@ If you run this code in the Rust playground, at least as of the time of writing,
 
 But we can dig deeper. My next question is, precisely what does it take to make Miri happy? The first change is to make `x` mutable: `let mut x = 2u64;`. Miri still doesn't like it, which tells us it isn't *just* about whether `x` is mutable, it's also about how x is borrowed. In fact, if you look at the Miri error again, you'll see the phrase "in borrow stack", indicating it is tracking the borrows. If we think about it, even though x is declared as mutable, we only borrow it immutably, so the compiler could still assume its value is never changed. That would be bad.
 
-So let's tell the compiler we are borrowing mutable. `let x_ptr = &mut x as *const u64 as usize;`. Now x is mutable *and* we borrow it mutably. Miri, however, is still unhappy with this code and for the same reason as before. We'll try `let x_ptr = &mut x as *mut u64 as usize;` now. And finally, Miri is happy! That tells us that even though we borrow x mutably, the act of converting the mutable borrow into an immutable pointer and back is enough to cause UB. Good to know.
+So let's tell the compiler we are borrowing mutable. `let x_ptr = &mut x as *const u64 as usize;`. Now x is mutable *and* we borrow it mutably. Miri, however, is still unhappy with this code and for the same reason as before (*See [Following Up](#Following-Up)). We'll try `let x_ptr = &mut x as *mut u64 as usize;` now. And finally, Miri is happy! That tells us that even though we borrow x mutably, the act of converting the mutable borrow into an immutable pointer and back is enough to cause UB. Good to know.
 
 Now that Miri is happy, we're done here, right? Well, no. There is still one thing I'd like to look at: `UnsafeCell`. Up until now, we've had UB because we wrote code in a way that allowed the compiler to make bad assumptions about our intentions. Every time the compiler assumes we won't change a value and we do, Miri gets mad and tells us about it. `UnsafeCell` allows us to tell the compiler to stop making assumptions about the contained value. Let's take a look at some code:
 
@@ -112,10 +113,64 @@ fn main() {
 
 Here, we break a different rule in Rust: no two mutable borrows may reference the same memory. `UnsafeCell` does not change this assumption, and so even when using `UnsafeCell`, we still need to be wary of creating mutable references to it.
 
-So to summarize what we've seen: if you intend to mutate something, even across FFI boundaries, always delcare it mutable, always take a mutable reference, and never convert said reference to an immutable reference or pointer. The only exception being if you use `UnsafeCell` to disable Rust's normal assumptions.
+So to summarize what we've seen: if you intend to mutate something, even across FFI boundaries, always delcare it mutable, always take a mutable reference, and never convert said reference directly to an immutable pointer. The only exception being if you use `UnsafeCell` to disable Rust's normal assumptions.
 
 ## Following Up
 
-It's come to my attention that in some instances it might be okay to convert a `*const` to a `*mut` and mutate it, however it's not clear to me yet when it is and isn't okay to do this. I may play around some more and make a follow up post in the future. For now, suffice to say that Rust's own [NonNull](https://doc.rust-lang.org/std/ptr/struct.NonNull.html) type uses `*const` internally but does allow converting to a `*mut` or `&mut`.
+It's come to my attention that in some instances it might be okay to convert a `*const` to a `*mut` and mutate it. However the conversion from `&mut` to `*const` is not as simple as it seems. Let's take a closer look:
 
-Additionally, many of these concepts are related to an aliasing model called [Stacked Borrows](https://www.ralfj.de/blog/2019/05/21/stacked-borrows-2.1.html), which is the model Miri is based on. Rust, however, does not yet have an official aliasing model, so precisely what constitutes UB is subject to change. A detailed paper on the model can be found [here](https://plv.mpi-sws.org/rustbelt/stacked-borrows/paper.pdf). I won't claim to fully understand this model, however as I explore and test the ideas of this model, I may make additional posts.
+```rust
+unsafe extern "C" fn put_one(x: *mut u64) {
+    *x = 1
+}
+fn main() {
+    let mut x = 2u64;
+    let x_ptr: &mut u64 = &mut x;
+    let x_ptr: *const u64 = x_ptr;
+    unsafe { put_one(x_ptr as _) }
+    println!("x: {}", x);
+}
+```
+
+([playground](https://play.rust-lang.org/?version=stable&mode=debug&edition=2018&gist=38986879a9d2340ddcf984eef4f75aad))
+
+This is very similar to code seen earlier. A couple differences are I'm being more explicit in pointer conversions, and skipping `usize` conversions. The conversion we do here is equvilant to `let x_ptr = &mut x as *const u64;` from before. As already established, it fails Miri. If we change `x_ptr: *const u64` to `x_ptr: *mut u64` in the code above, Miri is happy again. And it is at *this point* it is okay to convert the pointer to a `*const`. This code is completely fine according to Miri:
+
+```rust
+unsafe extern "C" fn put_one(x: *mut u64) {
+    *x = 1
+}
+fn main() {
+    let mut x = 2u64;
+    let x_ptr: &mut u64 = &mut x;
+    let x_ptr: *mut u64 = x_ptr;
+    let x_ptr: *const u64 = x_ptr;
+    unsafe { put_one(x_ptr as _) }
+    println!("x: {}", x);
+}
+```
+
+([playground](https://play.rust-lang.org/?version=stable&mode=debug&edition=2018&gist=699539ef06f1efcd6b95827174f571d1))
+
+We can see this is in Rust's standard library as well. The definition of [`NonNull`](https://doc.rust-lang.org/src/core/ptr/non_null.rs.html) is simple:
+
+```rust
+pub struct NonNull<T: ?Sized> {
+    pointer: *const T,
+}
+```
+
+`NonNull` also includes this conversion:
+
+```rust
+impl<T: ?Sized> From<&mut T> for NonNull<T> {
+    #[inline]
+    fn from(reference: &mut T) -> Self {
+        unsafe { NonNull { pointer: reference as *mut T } }
+    }
+}
+```
+
+The conversion `reference as *mut T` is not strictly necessary for the code to compile. However without that conversion, Miri would be unhappy anytime we mutated the underlying `T`.
+
+On a final note, many of these concepts are related to an aliasing model called [Stacked Borrows](https://www.ralfj.de/blog/2019/05/21/stacked-borrows-2.1.html), which is the model Miri is based on. Rust, however, does not yet have an official aliasing model, so precisely what constitutes UB is subject to change. A detailed paper on the model can be found [here](https://plv.mpi-sws.org/rustbelt/stacked-borrows/paper.pdf). I won't claim to fully understand this model, however as I explore and test the ideas of this model, I may make additional posts.
